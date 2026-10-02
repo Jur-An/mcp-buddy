@@ -1,4 +1,4 @@
-"""Credential-storage foundations for mcp-buddy."""
+"""Secure local MCP proxy and OAuth credential broker."""
 
 from .access_tokens import AccessTokenCache
 from .factory import build_secret_store

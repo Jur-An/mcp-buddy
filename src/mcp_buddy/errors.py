@@ -16,3 +16,11 @@ class VaultDecryptionError(McpBuddyError):
 
 class UnsafeConfigurationError(McpBuddyError):
     """Configuration contains a secret-like field or unsupported structure."""
+
+
+class OAuthError(McpBuddyError):
+    """OAuth discovery, authorization or token refresh failed safely."""
+
+
+class ProxyError(McpBuddyError):
+    """The local MCP proxy could not safely forward a request."""

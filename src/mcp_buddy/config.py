@@ -30,11 +30,14 @@ _SERVER_KEYS = {"url", "transport", "command", "auth"}
 _AUTH_KEYS = {
     "type",
     "credential_profile",
+    "account",
     "client_id",
+    "issuer",
     "authorization_url",
     "token_url",
     "resource",
     "scopes",
+    "callback_timeout_seconds",
 }
 _AUTH_TYPES = {"none", "oauth-pkce", "bearer"}
 _TRANSPORTS = {"stdio", "sse", "streamable-http"}
@@ -44,11 +47,14 @@ _TRANSPORTS = {"stdio", "sse", "streamable-http"}
 class AuthConfig:
     type: str
     credential_profile: str | None = None
+    account: str = "default"
     client_id: str | None = None
+    issuer: str | None = None
     authorization_url: str | None = None
     token_url: str | None = None
     resource: str | None = None
     scopes: tuple[str, ...] = ()
+    callback_timeout_seconds: int = 180
 
 
 @dataclass(frozen=True)
@@ -127,9 +133,27 @@ def _parse_server(name: str, raw: dict[str, Any]) -> ServerConfig:
         raise UnsafeConfigurationError(
             f"Server {name!r} auth requires credential_profile."
         )
+    account = auth_raw.get("account", "default")
+    if not isinstance(account, str) or not account:
+        raise UnsafeConfigurationError(f"Server {name!r} auth account must be a string.")
     scopes = auth_raw.get("scopes", [])
-    if not isinstance(scopes, list) or not all(isinstance(v, str) for v in scopes):
+    if not isinstance(scopes, list) or not all(isinstance(v, str) and v for v in scopes):
         raise UnsafeConfigurationError(f"Server {name!r} scopes must be a string list.")
+    client_id = auth_raw.get("client_id")
+    if auth_type == "oauth-pkce" and (not isinstance(client_id, str) or not client_id):
+        raise UnsafeConfigurationError(
+            f"Server {name!r} OAuth PKCE auth requires a public client_id."
+        )
+    timeout = auth_raw.get("callback_timeout_seconds", 180)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 30 <= timeout <= 900:
+        raise UnsafeConfigurationError(
+            f"Server {name!r} callback_timeout_seconds must be between 30 and 900."
+        )
+    resource = auth_raw.get("resource") or url
+    for field_name in ("issuer", "authorization_url", "token_url", "resource"):
+        value = auth_raw.get(field_name) if field_name != "resource" else resource
+        if value is not None:
+            _validate_https_url(value, f"server {name} auth {field_name}")
     return ServerConfig(
         name=name,
         transport=transport,
@@ -138,13 +162,32 @@ def _parse_server(name: str, raw: dict[str, Any]) -> ServerConfig:
         auth=AuthConfig(
             type=auth_type,
             credential_profile=profile,
-            client_id=auth_raw.get("client_id"),
+            account=account,
+            client_id=client_id,
+            issuer=auth_raw.get("issuer"),
             authorization_url=auth_raw.get("authorization_url"),
             token_url=auth_raw.get("token_url"),
-            resource=auth_raw.get("resource"),
+            resource=resource,
             scopes=tuple(scopes),
+            callback_timeout_seconds=timeout,
         ),
     )
+
+
+def _validate_https_url(value: Any, label: str) -> None:
+    if not isinstance(value, str):
+        raise UnsafeConfigurationError(f"{label} must be an HTTPS URL.")
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise UnsafeConfigurationError(
+            f"{label} must be HTTPS, contain no userinfo and contain no fragment."
+        )
 
 
 def _reject_secret_fields(value: Any, path: str = "root") -> None:

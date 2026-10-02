@@ -5,9 +5,14 @@ servers:
     auth:
       type: oauth-pkce
       credential_profile: fcm-prod
+      account: andjurek
       client_id: public-client-id
+      # Pinning the issuer is recommended and required if the resource advertises several.
+      issuer: https://login.example.com
       scopes:
         - mcp
+        # Include only when the authorization server supports/needs it for refresh tokens.
+        - offline_access
       resource: https://fcm.example.com/mcp
 
   local-tools:
