@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-buddy"
+version = "0.1.0"
+description = "Cross-platform credential broker foundations for MCP clients"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=43",
+  "keyring>=25",
+  "platformdirs>=4",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+mcp-buddy = "mcp_buddy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

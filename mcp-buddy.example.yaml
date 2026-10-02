@@ -1,0 +1,20 @@
+servers:
+  fcm:
+    url: https://fcm.example.com/mcp
+    transport: streamable-http
+    auth:
+      type: oauth-pkce
+      credential_profile: fcm-prod
+      client_id: public-client-id
+      scopes:
+        - mcp
+      resource: https://fcm.example.com/mcp
+
+  local-tools:
+    transport: stdio
+    command:
+      - python
+      - -m
+      - local_tools_mcp
+    auth:
+      type: none
