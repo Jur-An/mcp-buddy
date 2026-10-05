@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import logging
 from pathlib import Path
 import sys
 
 from .config import load_config
-from .errors import McpBuddyError
+from .errors import McpBuddyError, UnsafeConfigurationError
 from .factory import build_secret_store
 from .logging_utils import configure_logging
 from .models import CredentialKey, CredentialKind
+from .access_tokens import AccessTokenCache
+from .oauth import OAuthManager
+from .proxy import create_proxy_app, run_proxy
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +47,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = commands.add_parser("validate-config", help="Validate secret-free YAML config.")
     validate.add_argument("path", type=Path)
+
+    login = commands.add_parser("login", help="Log in through OAuth Authorization Code + PKCE.")
+    _add_config_server_arguments(login)
+
+    logout = commands.add_parser("logout", help="Delete a server's refresh token.")
+    _add_config_server_arguments(logout)
+
+    serve = commands.add_parser("serve", help="Run the loopback Streamable HTTP MCP proxy.")
+    serve.add_argument("config", type=Path)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
     return parser
 
 
@@ -50,6 +65,11 @@ def _add_key_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("server")
     parser.add_argument("account")
     parser.add_argument("--profile", default="default")
+
+
+def _add_config_server_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("config", type=Path)
+    parser.add_argument("server")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,6 +85,26 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "backend":
             print(store.backend_name)
             return 0
+
+        if args.command in {"login", "logout", "serve"}:
+            config = load_config(args.config)
+            if args.command == "serve":
+                app = create_proxy_app(config, store)
+                run_proxy(app, args.host, args.port)
+                return 0
+            server = config.servers.get(args.server)
+            if server is None:
+                raise UnsafeConfigurationError(
+                    f"Server {args.server!r} does not exist in the configuration."
+                )
+            manager = OAuthManager(store, AccessTokenCache())
+            if args.command == "login":
+                asyncio.run(manager.login(server))
+                print(f"OAuth login stored for server {server.name!r}.")
+                return 0
+            deleted = manager.logout(server)
+            print("OAuth login deleted." if deleted else "OAuth login not found.")
+            return 0 if deleted else 1
 
         key = CredentialKey(args.server, args.account, args.profile)
         if args.command == "store":

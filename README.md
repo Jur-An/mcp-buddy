@@ -1,62 +1,98 @@
 # mcp-buddy
 
-`mcp-buddy` is the security and credential-storage foundation for a future local
-MCP broker. Version `0.1.0` implements credential storage, an in-memory access
-token cache, safe configuration loading and log redaction. It does **not** yet
-proxy MCP traffic or implement OAuth authorization flows.
+`mcp-buddy` is a local Streamable HTTP MCP proxy with OAuth 2.1 Authorization
+Code + PKCE. It keeps short-lived access tokens only in process memory and
+persists refresh tokens through the operating system credential store.
 
-## Security model
+## What it does
 
-- Application code uses one `SecretStore` API.
+- discovers Protected Resource Metadata and OAuth/OIDC authorization-server
+  metadata;
+- opens the system browser and receives the authorization response on a random
+  `127.0.0.1` callback port;
+- uses PKCE S256, validates `state` and the authorization-response issuer, and
+  sends the MCP `resource` parameter in authorization and token requests;
+- uses a configured public `client_id` when present, or falls back to Dynamic
+  Client Registration for authorization servers that advertise it;
+- stores only the refresh token plus its non-secret issuer/resource/client
+  binding; rotated refresh tokens replace previous values;
+- exposes each allowlisted remote server at
+  `http://127.0.0.1:8765/mcp/<server-name>`;
+- injects Bearer authorization upstream, refreshes once after HTTP 401, and
+  streams JSON or SSE responses;
+- supports current MCP request headers and preserves the legacy
+  `Mcp-Session-Id` header for older servers.
+
+The proxy drops incoming `Authorization`, cookies and unrelated headers. It
+rejects non-loopback browser origins and cannot bind to `0.0.0.0` or a LAN
+address. Redirects are disabled for metadata, token and MCP requests.
+
+## Secret storage
+
 - Windows and macOS use the native backend selected by Python `keyring`.
-- Linux uses the native Secret Service/KWallet backend when available.
+- Linux uses Secret Service/KWallet when available.
 - Linux without a usable native backend falls back to an AES-256-GCM encrypted
   vault protected by a passphrase-derived scrypt key.
-- Access tokens can only be stored in `AccessTokenCache`, which is process
-  memory and has no persistence API.
-- Persistent stores accept only refresh tokens and long-lived credentials.
-- Secrets are entered through an interactive hidden prompt. CLI options,
-  environment variables and YAML secret values are intentionally unsupported.
-- YAML is schema-validated and secret-like fields are rejected recursively.
-- Secret values use a redacted representation, and application logging installs
-  a defense-in-depth redaction filter.
+- Access tokens use `AccessTokenCache`, which has no persistence API.
+- YAML, CLI options, logs and the executable never contain secrets.
 
 The encrypted Linux fallback cannot start unattended without an unlock source.
-This is deliberate: storing its passphrase in a file, environment variable or
-command line would move rather than solve the bootstrap-secret problem.
+This is deliberate: putting its passphrase in a file, environment variable or
+command line would only move the bootstrap secret.
 
-## Installation
+## Configuration
+
+Copy `mcp-buddy.example.yaml`, or use `mcp-buddy.fcm.example.yaml` for FCM. A
+pre-registered public OAuth client ID is optional. When `client_id` is absent,
+`login` uses the discovered Dynamic Client Registration endpoint and registers
+a native public client for its exact loopback callback. It requests
+`token_endpoint_auth_method: none`; a response containing a client secret is
+rejected.
+
+`issuer`, `authorization_url`, `token_url` and `registration_url`, when
+present, are security pins and must match discovery metadata. Pinning `issuer`
+is recommended and becomes required when a resource advertises more than one
+authorization server. DCR is retained by MCP for backwards compatibility and
+is used here because FCM currently advertises DCR rather than Client ID
+Metadata Documents.
+
+The authorization server must issue a refresh token because `mcp-buddy` refuses
+to persist an access token. Add `offline_access` only if the provider advertises
+or requires that scope.
+
+## Installation and use
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\python -m pip install -e .
+mcp-buddy validate-config mcp-buddy.yaml
+mcp-buddy login mcp-buddy.yaml fcm
+mcp-buddy serve mcp-buddy.yaml --host 127.0.0.1 --port 8765
 ```
 
-Linux/macOS:
+Point the MCP client at:
 
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
+```text
+http://127.0.0.1:8765/mcp/fcm
 ```
 
-## CLI
-
-The CLI never accepts a secret as an argument and never prints a stored value.
+Other credential commands remain available:
 
 ```text
 mcp-buddy backend
-mcp-buddy store fcm andjurek --profile fcm-prod --kind refresh-token
 mcp-buddy check fcm andjurek --profile fcm-prod
-mcp-buddy delete fcm andjurek --profile fcm-prod
-mcp-buddy validate-config mcp-buddy.yaml
+mcp-buddy logout mcp-buddy.yaml fcm
 ```
 
-`store` reads the credential through `getpass`. On headless Linux using the
-encrypted fallback, the vault passphrase is also requested through `getpass`.
+`login` opens a browser. Its local callback expires after 180 seconds by
+default; `callback_timeout_seconds` can be set to 30-900 in the server's `auth`
+section. On a successful DCR login, the issued non-secret `client_id` is bound
+to the discovered issuer and persisted inside the refresh-token credential.
+Subsequent `serve` runs reuse it during refresh and do not register again.
 
 ## Building an executable
 
-Build separately on every target OS and architecture:
+Build separately on each target operating system and architecture:
 
 ```powershell
 python -m pip install -e ".[build]"
@@ -72,9 +108,3 @@ should also be notarized.
 ```powershell
 python -B -m unittest discover -s tests -v
 ```
-
-## Next scope
-
-The next layer can add OAuth 2.1/PKCE and a loopback MCP proxy. It should obtain
-refresh tokens through this package, keep access tokens in `AccessTokenCache`,
-and inject authorization only for an exact allowlisted MCP origin and resource.

@@ -110,6 +110,20 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
             self.assertEqual(config.servers["fcm"].auth.credential_profile, "fcm-prod")
 
+    def test_oauth_dynamic_registration_config_needs_no_client_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.yaml"
+            path.write_text(
+                """servers:\n  fcm:\n    url: https://fcm.example.com/mcp\n    transport: streamable-http\n    auth:\n      type: oauth-pkce\n      credential_profile: fcm-prod\n      issuer: https://auth.example.com\n      registration_url: https://auth.example.com/register\n      scopes: [mcp]\n""",
+                encoding="utf-8",
+            )
+            config = load_config(path)
+            self.assertIsNone(config.servers["fcm"].auth.client_id)
+            self.assertEqual(
+                config.servers["fcm"].auth.registration_url,
+                "https://auth.example.com/register",
+            )
+
     def test_secret_like_yaml_field_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "bad.yaml"
