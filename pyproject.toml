@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-buddy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Secure local MCP proxy with cross-platform OAuth credential storage"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -11,3 +11,4 @@ dist/
 *.vault
 *.vault.lock
 mcp-buddy.yaml
+mcp-buddy.fcm.example.yaml

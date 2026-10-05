@@ -26,6 +26,7 @@ class OAuthMetadata:
     issuer: str
     authorization_endpoint: str
     token_endpoint: str
+    registration_endpoint: str | None = None
     authorization_response_iss_parameter_supported: bool = False
 
 
@@ -103,11 +104,12 @@ def build_authorization_url(
     redirect_uri: str,
     state: str,
     challenge: str,
+    client_id: str | None = None,
 ) -> str:
     auth = server.auth
     parameters: list[tuple[str, str]] = [
         ("response_type", "code"),
-        ("client_id", _required(auth.client_id, "client_id")),
+        ("client_id", _required(client_id or auth.client_id, "client_id")),
         ("redirect_uri", redirect_uri),
         ("state", state),
         ("code_challenge", challenge),
@@ -173,8 +175,21 @@ class OAuthManager:
                 raw_metadata, "authorization_endpoint"
             )
             token_endpoint = _metadata_https_url(raw_metadata, "token_endpoint")
+            registration_endpoint = _metadata_optional_https_url(
+                raw_metadata, "registration_endpoint"
+            )
             _match_pin(server.auth.authorization_url, authorization_endpoint, "authorization_url")
             _match_pin(server.auth.token_url, token_endpoint, "token_url")
+            if server.auth.registration_url is not None:
+                if registration_endpoint is None:
+                    raise OAuthError(
+                        "Configured OAuth registration_url was not advertised by the authorization server."
+                    )
+                _match_pin(
+                    server.auth.registration_url,
+                    registration_endpoint,
+                    "registration_url",
+                )
             methods = raw_metadata.get("code_challenge_methods_supported")
             if not isinstance(methods, list) or "S256" not in methods:
                 raise OAuthError("Authorization server does not advertise PKCE S256 support.")
@@ -193,6 +208,7 @@ class OAuthManager:
                 issuer=issuer,
                 authorization_endpoint=authorization_endpoint,
                 token_endpoint=token_endpoint,
+                registration_endpoint=registration_endpoint,
                 authorization_response_iss_parameter_supported=bool(
                     raw_metadata.get("authorization_response_iss_parameter_supported", False)
                 ),
@@ -240,8 +256,11 @@ class OAuthManager:
         try:
             port = listener.sockets[0].getsockname()[1]
             redirect_uri = f"http://127.0.0.1:{port}/callback"
+            client_id = server.auth.client_id or await self.register_client(
+                metadata, server, redirect_uri
+            )
             authorization_url = build_authorization_url(
-                metadata, server, redirect_uri, state, challenge
+                metadata, server, redirect_uri, state, challenge, client_id
             )
             if not self._browser_open(authorization_url):
                 raise OAuthError("Could not open the system browser for OAuth login.")
@@ -274,7 +293,7 @@ class OAuthManager:
             {
                 "grant_type": "authorization_code",
                 "code": code,
-                "client_id": _required(server.auth.client_id, "client_id"),
+                "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "code_verifier": verifier,
                 "resource": _required(server.auth.resource, "resource"),
@@ -285,8 +304,76 @@ class OAuthManager:
             raise OAuthError(
                 "Authorization server did not issue a refresh token; mcp-buddy will not persist an access token."
             )
-        self._save_credential(server, metadata.issuer, refresh_token)
+        self._save_credential(server, metadata.issuer, client_id, refresh_token)
         self._cache_access_token(server, token)
+
+    async def register_client(
+        self,
+        metadata: OAuthMetadata,
+        server: ServerConfig,
+        redirect_uri: str,
+    ) -> str:
+        endpoint = metadata.registration_endpoint
+        if endpoint is None:
+            raise OAuthError(
+                "OAuth client_id is not configured and the authorization server does not advertise Dynamic Client Registration."
+            )
+        registration: dict[str, Any] = {
+            "client_name": "mcp-buddy",
+            "client_uri": "https://github.com/Jur-An/mcp-buddy",
+            "software_id": "mcp-buddy",
+            "application_type": "native",
+            "redirect_uris": [redirect_uri],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }
+        if server.auth.scopes:
+            registration["scope"] = " ".join(server.auth.scopes)
+        client, owned = self._http_client()
+        try:
+            try:
+                response = await client.post(
+                    endpoint,
+                    json=registration,
+                    headers={"Accept": "application/json"},
+                    follow_redirects=False,
+                )
+            except httpx.HTTPError as exc:
+                raise OAuthError(
+                    "OAuth Dynamic Client Registration endpoint could not be reached."
+                ) from exc
+            if response.status_code != 201:
+                raise OAuthError(
+                    "OAuth Dynamic Client Registration returned "
+                    f"HTTP {response.status_code}."
+                )
+            payload = _response_json(
+                response, "OAuth Dynamic Client Registration endpoint"
+            )
+            client_id = payload.get("client_id")
+            if not isinstance(client_id, str) or not client_id:
+                raise OAuthError(
+                    "OAuth Dynamic Client Registration response has no client_id."
+                )
+            if payload.get("client_secret"):
+                raise OAuthError(
+                    "Authorization server returned a client_secret, but mcp-buddy only supports public clients."
+                )
+            auth_method = payload.get("token_endpoint_auth_method")
+            if auth_method is not None and auth_method != "none":
+                raise OAuthError(
+                    "Dynamically registered client does not use token_endpoint_auth_method=none."
+                )
+            redirect_uris = payload.get("redirect_uris")
+            if isinstance(redirect_uris, list) and redirect_uri not in redirect_uris:
+                raise OAuthError(
+                    "Dynamically registered client does not allow the current loopback callback."
+                )
+            return client_id
+        finally:
+            if owned:
+                await client.aclose()
 
     async def access_token(self, server: ServerConfig, *, force_refresh: bool = False) -> str:
         key = self.credential_key(server)
@@ -303,13 +390,14 @@ class OAuthManager:
             raise OAuthError(f"No OAuth login exists for server {server.name!r}; run mcp-buddy login.")
         credential = OAuthCredential.parse(stored.secret.reveal())
         metadata = await self.discover(server)
-        expected = (
-            metadata.issuer,
-            _required(server.auth.resource, "resource"),
-            _required(server.auth.client_id, "client_id"),
-        )
-        actual = (credential.issuer, credential.resource, credential.client_id)
-        if actual != expected:
+        if (
+            credential.issuer != metadata.issuer
+            or credential.resource != _required(server.auth.resource, "resource")
+            or (
+                server.auth.client_id is not None
+                and credential.client_id != server.auth.client_id
+            )
+        ):
             raise OAuthError("Stored refresh token is bound to different OAuth metadata.")
         token = await self._token_request(
             metadata.token_endpoint,
@@ -324,7 +412,9 @@ class OAuthManager:
         if rotated is not None:
             if not isinstance(rotated, str) or not rotated:
                 raise OAuthError("Authorization server returned an invalid rotated refresh token.")
-            self._save_credential(server, metadata.issuer, rotated)
+            self._save_credential(
+                server, metadata.issuer, credential.client_id, rotated
+            )
         self._cache_access_token(server, token)
         cached = self._access_tokens.get(key)
         if cached is None:
@@ -371,12 +461,18 @@ class OAuthManager:
             if owned:
                 await client.aclose()
 
-    def _save_credential(self, server: ServerConfig, issuer: str, refresh_token: str) -> None:
+    def _save_credential(
+        self,
+        server: ServerConfig,
+        issuer: str,
+        client_id: str,
+        refresh_token: str,
+    ) -> None:
         credential = OAuthCredential(
             refresh_token=refresh_token,
             issuer=issuer,
             resource=_required(server.auth.resource, "resource"),
-            client_id=_required(server.auth.client_id, "client_id"),
+            client_id=client_id,
         )
         self._store.set(
             self.credential_key(server), CredentialKind.REFRESH_TOKEN, credential.serialize()
@@ -434,6 +530,14 @@ def _metadata_https_url(metadata: dict[str, Any], field: str) -> str:
     ):
         raise OAuthError(f"Authorization server {field} is not a safe HTTPS URL.")
     return value
+
+
+def _metadata_optional_https_url(
+    metadata: dict[str, Any], field: str
+) -> str | None:
+    if field not in metadata:
+        return None
+    return _metadata_https_url(metadata, field)
 
 
 def _match_pin(configured: str | None, discovered: str, label: str) -> None:

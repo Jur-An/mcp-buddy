@@ -35,6 +35,7 @@ _AUTH_KEYS = {
     "issuer",
     "authorization_url",
     "token_url",
+    "registration_url",
     "resource",
     "scopes",
     "callback_timeout_seconds",
@@ -52,6 +53,7 @@ class AuthConfig:
     issuer: str | None = None
     authorization_url: str | None = None
     token_url: str | None = None
+    registration_url: str | None = None
     resource: str | None = None
     scopes: tuple[str, ...] = ()
     callback_timeout_seconds: int = 180
@@ -140,9 +142,9 @@ def _parse_server(name: str, raw: dict[str, Any]) -> ServerConfig:
     if not isinstance(scopes, list) or not all(isinstance(v, str) and v for v in scopes):
         raise UnsafeConfigurationError(f"Server {name!r} scopes must be a string list.")
     client_id = auth_raw.get("client_id")
-    if auth_type == "oauth-pkce" and (not isinstance(client_id, str) or not client_id):
+    if client_id is not None and (not isinstance(client_id, str) or not client_id):
         raise UnsafeConfigurationError(
-            f"Server {name!r} OAuth PKCE auth requires a public client_id."
+            f"Server {name!r} auth client_id must be a non-empty string."
         )
     timeout = auth_raw.get("callback_timeout_seconds", 180)
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 30 <= timeout <= 900:
@@ -150,7 +152,13 @@ def _parse_server(name: str, raw: dict[str, Any]) -> ServerConfig:
             f"Server {name!r} callback_timeout_seconds must be between 30 and 900."
         )
     resource = auth_raw.get("resource") or url
-    for field_name in ("issuer", "authorization_url", "token_url", "resource"):
+    for field_name in (
+        "issuer",
+        "authorization_url",
+        "token_url",
+        "registration_url",
+        "resource",
+    ):
         value = auth_raw.get(field_name) if field_name != "resource" else resource
         if value is not None:
             _validate_https_url(value, f"server {name} auth {field_name}")
@@ -167,6 +175,7 @@ def _parse_server(name: str, raw: dict[str, Any]) -> ServerConfig:
             issuer=auth_raw.get("issuer"),
             authorization_url=auth_raw.get("authorization_url"),
             token_url=auth_raw.get("token_url"),
+            registration_url=auth_raw.get("registration_url"),
             resource=resource,
             scopes=tuple(scopes),
             callback_timeout_seconds=timeout,

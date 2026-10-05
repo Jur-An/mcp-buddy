@@ -5,10 +5,12 @@ servers:
     auth:
       type: oauth-pkce
       credential_profile: fcm-prod
-      account: andjurek
-      client_id: public-client-id
+      account: axxju
+      # Omit client_id to use Dynamic Client Registration. Alternatively,
+      # provide a pre-registered public client ID here.
       # Pinning the issuer is recommended and required if the resource advertises several.
       issuer: https://login.example.com
+      registration_url: https://login.example.com/oauth/register
       scopes:
         - mcp
         # Include only when the authorization server supports/needs it for refresh tokens.

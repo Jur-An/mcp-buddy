@@ -12,6 +12,7 @@ from mcp_buddy.access_tokens import AccessTokenCache
 from mcp_buddy.config import AuthConfig, BuddyConfig, ServerConfig
 from mcp_buddy.models import CredentialKey
 from mcp_buddy.oauth import (
+    OAuthMetadata,
     OAuthManager,
     authorization_server_metadata_urls,
     create_pkce_pair,
@@ -19,6 +20,7 @@ from mcp_buddy.oauth import (
 )
 from mcp_buddy.proxy import create_proxy_app, is_loopback_host
 from mcp_buddy.stores import NativeKeyringStore
+from mcp_buddy.errors import OAuthError
 
 
 class FakeKeyring:
@@ -50,6 +52,24 @@ def oauth_server() -> ServerConfig:
             issuer="https://auth.example.com",
             resource="https://fcm.example.com/mcp",
             scopes=("mcp", "offline_access"),
+            callback_timeout_seconds=30,
+        ),
+    )
+
+
+def dynamic_oauth_server() -> ServerConfig:
+    return ServerConfig(
+        name="fcm-dynamic",
+        url="https://fcm.example.com/mcp",
+        transport="streamable-http",
+        auth=AuthConfig(
+            type="oauth-pkce",
+            credential_profile="prod",
+            account="andjurek",
+            issuer="https://auth.example.com",
+            registration_url="https://auth.example.com/register",
+            resource="https://fcm.example.com/mcp",
+            scopes=("mcp",),
             callback_timeout_seconds=30,
         ),
     )
@@ -160,6 +180,144 @@ class OAuthTests(unittest.IsolatedAsyncioTestCase):
         stored_envelope = json.loads(store.get(key).secret.reveal())
         self.assertEqual(stored_envelope["refresh_token"], "refresh-rotated")
         self.assertEqual(token_requests[1]["resource"], [server.auth.resource])
+        await async_client.aclose()
+
+    async def test_dynamic_registration_client_is_bound_and_reused_for_refresh(self) -> None:
+        registrations: list[dict[str, object]] = []
+        authorization_client_ids: list[str] = []
+        token_requests: list[dict[str, list[str]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "fcm.example.com":
+                return httpx.Response(
+                    200,
+                    json={
+                        "resource": "https://fcm.example.com/mcp",
+                        "authorization_servers": ["https://auth.example.com"],
+                    },
+                )
+            if request.url.path == "/.well-known/oauth-authorization-server":
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": "https://auth.example.com",
+                        "authorization_endpoint": "https://auth.example.com/authorize",
+                        "token_endpoint": "https://auth.example.com/token",
+                        "registration_endpoint": "https://auth.example.com/register",
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["none"],
+                        "scopes_supported": ["mcp"],
+                    },
+                )
+            if request.url.path == "/register":
+                registration = json.loads(request.content)
+                registrations.append(registration)
+                return httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dynamic-client-id",
+                        "redirect_uris": registration["redirect_uris"],
+                        "token_endpoint_auth_method": "none",
+                    },
+                )
+            if request.url.path == "/token":
+                form = parse_qs(request.content.decode("ascii"))
+                token_requests.append(form)
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": f"access-{len(token_requests)}",
+                        "refresh_token": "dynamic-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    },
+                )
+            return httpx.Response(404)
+
+        async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = FakeKeyring()
+        store = NativeKeyringStore(backend)
+        cache = AccessTokenCache(expiry_skew=timedelta(0))
+
+        def open_browser(url: str) -> bool:
+            params = parse_qs(urlsplit(url).query)
+            authorization_client_ids.append(params["client_id"][0])
+            redirect = urlsplit(params["redirect_uri"][0])
+
+            async def callback() -> None:
+                reader, writer = await asyncio.open_connection(
+                    redirect.hostname, redirect.port
+                )
+                path = (
+                    f"{redirect.path}?code=test-code&state={quote(params['state'][0])}"
+                )
+                writer.write(
+                    f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode()
+                )
+                await writer.drain()
+                await reader.read()
+                writer.close()
+                await writer.wait_closed()
+
+            asyncio.get_running_loop().create_task(callback())
+            return True
+
+        manager = OAuthManager(
+            store, cache, client=async_client, browser_open=open_browser
+        )
+        server = dynamic_oauth_server()
+        await manager.login(server)
+
+        self.assertEqual(len(registrations), 1)
+        registration = registrations[0]
+        self.assertEqual(registration["application_type"], "native")
+        self.assertEqual(registration["token_endpoint_auth_method"], "none")
+        self.assertEqual(
+            registration["grant_types"], ["authorization_code", "refresh_token"]
+        )
+        self.assertEqual(authorization_client_ids, ["dynamic-client-id"])
+        self.assertEqual(token_requests[0]["client_id"], ["dynamic-client-id"])
+        self.assertEqual(
+            registration["redirect_uris"], token_requests[0]["redirect_uri"]
+        )
+        key = CredentialKey("fcm-dynamic", "andjurek", "prod")
+        stored_envelope = json.loads(store.get(key).secret.reveal())
+        self.assertEqual(stored_envelope["client_id"], "dynamic-client-id")
+
+        refreshed = await manager.access_token(server, force_refresh=True)
+        self.assertEqual(refreshed, "access-2")
+        self.assertEqual(len(registrations), 1)
+        self.assertEqual(token_requests[1]["client_id"], ["dynamic-client-id"])
+        await async_client.aclose()
+
+    async def test_dynamic_registration_rejects_client_secret(self) -> None:
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                201,
+                json={
+                    "client_id": "confidential-client",
+                    "client_secret": "must-not-be-stored",
+                },
+            )
+
+        async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        manager = OAuthManager(
+            NativeKeyringStore(FakeKeyring()),
+            AccessTokenCache(),
+            client=async_client,
+        )
+        metadata = OAuthMetadata(
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            registration_endpoint="https://auth.example.com/register",
+        )
+        with self.assertRaisesRegex(OAuthError, "client_secret"):
+            await manager.register_client(
+                metadata,
+                dynamic_oauth_server(),
+                "http://127.0.0.1:49152/callback",
+            )
         await async_client.aclose()
 
 

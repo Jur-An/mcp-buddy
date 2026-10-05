@@ -12,6 +12,8 @@ persists refresh tokens through the operating system credential store.
   `127.0.0.1` callback port;
 - uses PKCE S256, validates `state` and the authorization-response issuer, and
   sends the MCP `resource` parameter in authorization and token requests;
+- uses a configured public `client_id` when present, or falls back to Dynamic
+  Client Registration for authorization servers that advertise it;
 - stores only the refresh token plus its non-secret issuer/resource/client
   binding; rotated refresh tokens replace previous values;
 - exposes each allowlisted remote server at
@@ -40,11 +42,19 @@ command line would only move the bootstrap secret.
 
 ## Configuration
 
-Copy `mcp-buddy.example.yaml`. A pre-registered public OAuth client ID is
-currently required; client secrets are intentionally unsupported. `issuer`,
-`authorization_url` and `token_url`, when present, are security pins and must
-match discovery metadata. Pinning `issuer` is recommended and becomes required
-when a resource advertises more than one authorization server.
+Copy `mcp-buddy.example.yaml`, or use `mcp-buddy.fcm.example.yaml` for FCM. A
+pre-registered public OAuth client ID is optional. When `client_id` is absent,
+`login` uses the discovered Dynamic Client Registration endpoint and registers
+a native public client for its exact loopback callback. It requests
+`token_endpoint_auth_method: none`; a response containing a client secret is
+rejected.
+
+`issuer`, `authorization_url`, `token_url` and `registration_url`, when
+present, are security pins and must match discovery metadata. Pinning `issuer`
+is recommended and becomes required when a resource advertises more than one
+authorization server. DCR is retained by MCP for backwards compatibility and
+is used here because FCM currently advertises DCR rather than Client ID
+Metadata Documents.
 
 The authorization server must issue a refresh token because `mcp-buddy` refuses
 to persist an access token. Add `offline_access` only if the provider advertises
@@ -76,7 +86,9 @@ mcp-buddy logout mcp-buddy.yaml fcm
 
 `login` opens a browser. Its local callback expires after 180 seconds by
 default; `callback_timeout_seconds` can be set to 30-900 in the server's `auth`
-section.
+section. On a successful DCR login, the issued non-secret `client_id` is bound
+to the discovered issuer and persisted inside the refresh-token credential.
+Subsequent `serve` runs reuse it during refresh and do not register again.
 
 ## Building an executable
 
