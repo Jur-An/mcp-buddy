@@ -42,7 +42,7 @@ command line would only move the bootstrap secret.
 
 ## Configuration
 
-Copy `mcp-buddy.example.yaml`, or use `mcp-buddy.fcm.example.yaml` for FCM. A
+Copy `mcp-buddy.example.yaml` to `mcp-buddy.yaml` and adjust it. A
 pre-registered public OAuth client ID is optional. When `client_id` is absent,
 `login` uses the discovered Dynamic Client Registration endpoint and registers
 a native public client for its exact loopback callback. It requests
@@ -53,8 +53,8 @@ rejected.
 present, are security pins and must match discovery metadata. Pinning `issuer`
 is recommended and becomes required when a resource advertises more than one
 authorization server. DCR is retained by MCP for backwards compatibility and
-is used here because FCM currently advertises DCR rather than Client ID
-Metadata Documents.
+is used here for authorization servers that advertise DCR rather than Client
+ID Metadata Documents.
 
 The authorization server must issue a refresh token because `mcp-buddy` refuses
 to persist an access token. Add `offline_access` only if the provider advertises
@@ -69,6 +69,12 @@ mcp-buddy validate-config mcp-buddy.yaml
 mcp-buddy login mcp-buddy.yaml fcm
 mcp-buddy serve mcp-buddy.yaml --host 127.0.0.1 --port 8765
 ```
+
+or
+```powershell
+python mcp_buddy_entry.py serve mcp-buddy.yaml --host 127.0.0.1 --port 8765
+```
+
 
 Point the MCP client at:
 
