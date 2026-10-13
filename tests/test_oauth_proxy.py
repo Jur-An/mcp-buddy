@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import json
+from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 import unittest
 
@@ -10,8 +11,9 @@ import httpx
 
 from mcp_buddy.access_tokens import AccessTokenCache
 from mcp_buddy.config import AuthConfig, BuddyConfig, ServerConfig
-from mcp_buddy.models import CredentialKey
+from mcp_buddy.models import CredentialKey, CredentialKind
 from mcp_buddy.oauth import (
+    OAuthCredential,
     OAuthMetadata,
     OAuthManager,
     authorization_server_metadata_urls,
@@ -320,12 +322,139 @@ class OAuthTests(unittest.IsolatedAsyncioTestCase):
             )
         await async_client.aclose()
 
+    def _rotating_auth_server(self) -> tuple[httpx.AsyncClient, dict[str, int], dict[str, Any]]:
+        """Auth server that rotates refresh tokens and rejects reuse of old ones."""
+        counts = {"prm": 0, "metadata": 0, "token": 0}
+        state: dict[str, Any] = {"current_refresh": "refresh-0", "fail_token": False}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "fcm.example.com":
+                counts["prm"] += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "resource": "https://fcm.example.com/mcp",
+                        "authorization_servers": ["https://auth.example.com"],
+                    },
+                )
+            if request.url.path == "/.well-known/oauth-authorization-server":
+                counts["metadata"] += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": "https://auth.example.com",
+                        "authorization_endpoint": "https://auth.example.com/authorize",
+                        "token_endpoint": "https://auth.example.com/token",
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["none"],
+                    },
+                )
+            if request.url.path == "/token":
+                counts["token"] += 1
+                await asyncio.sleep(0.01)
+                if state["fail_token"]:
+                    return httpx.Response(503)
+                form = parse_qs(request.content.decode("ascii"))
+                if form["refresh_token"] != [state["current_refresh"]]:
+                    return httpx.Response(400, json={"error": "invalid_grant"})
+                number = counts["token"]
+                state["current_refresh"] = f"refresh-{number}"
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": f"access-{number}",
+                        "refresh_token": f"refresh-{number}",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    },
+                )
+            return httpx.Response(404)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler)), counts, state
+
+    def _logged_in_manager(self, client: httpx.AsyncClient) -> OAuthManager:
+        server = oauth_server()
+        store = NativeKeyringStore(FakeKeyring())
+        store.set(
+            CredentialKey("fcm", "andjurek", "prod"),
+            CredentialKind.REFRESH_TOKEN,
+            OAuthCredential(
+                refresh_token="refresh-0",
+                issuer="https://auth.example.com",
+                resource=server.auth.resource,
+                client_id="public-client",
+            ).serialize(),
+        )
+        return OAuthManager(store, AccessTokenCache(expiry_skew=timedelta(0)), client=client)
+
+    async def test_concurrent_requests_share_one_refresh(self) -> None:
+        client, counts, _ = self._rotating_auth_server()
+        manager = self._logged_in_manager(client)
+        server = oauth_server()
+
+        tokens = await asyncio.gather(*(manager.access_token(server) for _ in range(5)))
+
+        self.assertEqual(set(tokens), {"access-1"})
+        self.assertEqual(counts["token"], 1)
+        await client.aclose()
+
+    async def test_concurrent_401_retries_share_one_refresh(self) -> None:
+        client, counts, _ = self._rotating_auth_server()
+        manager = self._logged_in_manager(client)
+        server = oauth_server()
+        rejected = await manager.access_token(server)
+
+        tokens = await asyncio.gather(
+            *(
+                manager.access_token(server, force_refresh=True, rejected_token=rejected)
+                for _ in range(5)
+            )
+        )
+
+        self.assertEqual(set(tokens), {"access-2"})
+        self.assertEqual(counts["token"], 2)
+        await client.aclose()
+
+    async def test_refresh_reuses_discovered_metadata(self) -> None:
+        client, counts, _ = self._rotating_auth_server()
+        manager = self._logged_in_manager(client)
+        server = oauth_server()
+
+        for _ in range(3):
+            await manager.access_token(server, force_refresh=True)
+
+        self.assertEqual(counts["token"], 3)
+        self.assertEqual(counts["prm"], 1)
+        self.assertEqual(counts["metadata"], 1)
+        await client.aclose()
+
+    async def test_failed_refresh_drops_cached_metadata(self) -> None:
+        client, counts, state = self._rotating_auth_server()
+        manager = self._logged_in_manager(client)
+        server = oauth_server()
+        await manager.access_token(server)
+
+        state["fail_token"] = True
+        with self.assertRaisesRegex(OAuthError, "HTTP 503"):
+            await manager.access_token(server, force_refresh=True)
+        state["fail_token"] = False
+        self.assertEqual(await manager.access_token(server, force_refresh=True), "access-3")
+
+        self.assertEqual(counts["prm"], 2)
+        await client.aclose()
+
 
 class FakeOAuthManager:
     def __init__(self) -> None:
         self.calls: list[bool] = []
 
-    async def access_token(self, server: ServerConfig, *, force_refresh: bool = False) -> str:
+    async def access_token(
+        self,
+        server: ServerConfig,
+        *,
+        force_refresh: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
         self.calls.append(force_refresh)
         return "second-token" if force_refresh else "first-token"
 

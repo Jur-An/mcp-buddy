@@ -123,13 +123,13 @@ async def _send(
     incoming_headers: object,
     body: bytes,
 ) -> httpx.Response:
-    token = await _token_for(oauth, store, server, force_refresh=False)
+    token = await _token_for(oauth, store, server)
     response = await _send_once(
         client, server, method, incoming_headers, body, token
     )
     if response.status_code == 401 and server.auth.type == "oauth-pkce":
         await response.aclose()
-        token = await _token_for(oauth, store, server, force_refresh=True)
+        token = await _token_for(oauth, store, server, rejected_token=token)
         response = await _send_once(
             client, server, method, incoming_headers, body, token
         )
@@ -161,12 +161,16 @@ async def _token_for(
     store: SecretStore,
     server: ServerConfig,
     *,
-    force_refresh: bool,
+    rejected_token: str | None = None,
 ) -> str | None:
     if server.auth.type == "none":
         return None
     if server.auth.type == "oauth-pkce":
-        return await oauth.access_token(server, force_refresh=force_refresh)
+        if rejected_token is None:
+            return await oauth.access_token(server)
+        return await oauth.access_token(
+            server, force_refresh=True, rejected_token=rejected_token
+        )
     if server.auth.type == "bearer":
         key = CredentialKey(
             server.name,

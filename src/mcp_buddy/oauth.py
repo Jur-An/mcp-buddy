@@ -135,6 +135,8 @@ class OAuthManager:
         self._access_tokens = access_tokens
         self._client = client
         self._browser_open = browser_open
+        self._metadata: dict[ServerConfig, OAuthMetadata] = {}
+        self._refresh_locks: dict[CredentialKey, asyncio.Lock] = {}
 
     async def discover(self, server: ServerConfig) -> OAuthMetadata:
         if server.auth.type != "oauth-pkce":
@@ -219,6 +221,7 @@ class OAuthManager:
 
     async def login(self, server: ServerConfig) -> None:
         metadata = await self.discover(server)
+        self._metadata[server] = metadata
         verifier, challenge = create_pkce_pair()
         state = secrets.token_urlsafe(32)
         callback = asyncio.get_running_loop().create_future()
@@ -375,21 +378,60 @@ class OAuthManager:
             if owned:
                 await client.aclose()
 
-    async def access_token(self, server: ServerConfig, *, force_refresh: bool = False) -> str:
+    async def access_token(
+        self,
+        server: ServerConfig,
+        *,
+        force_refresh: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
+        """Return a valid access token, refreshing at most once per credential at a time.
+
+        With ``force_refresh`` and ``rejected_token``, a cached token other than the
+        rejected one was refreshed concurrently and is returned without refreshing again.
+        """
         key = self.credential_key(server)
         if not force_refresh:
             cached = self._access_tokens.get(key)
             if cached is not None:
                 return cached.reveal()
-        return await self.refresh(server)
+        async with self._refresh_lock(key):
+            cached = self._access_tokens.get(key)
+            if cached is not None and (
+                not force_refresh
+                or (rejected_token is not None and cached.reveal() != rejected_token)
+            ):
+                return cached.reveal()
+            return await self._refresh_locked(server)
 
     async def refresh(self, server: ServerConfig) -> str:
+        async with self._refresh_lock(self.credential_key(server)):
+            return await self._refresh_locked(server)
+
+    async def _refresh_locked(self, server: ServerConfig) -> str:
         key = self.credential_key(server)
         stored = self._store.get(key)
         if stored is None or stored.kind != CredentialKind.REFRESH_TOKEN:
             raise OAuthError(f"No OAuth login exists for server {server.name!r}; run mcp-buddy login.")
         credential = OAuthCredential.parse(stored.secret.reveal())
-        metadata = await self.discover(server)
+        metadata = self._metadata.get(server)
+        if metadata is None:
+            metadata = await self.discover(server)
+            self._metadata[server] = metadata
+        try:
+            return await self._refresh_with(server, key, credential, metadata)
+        except OAuthError:
+            # Endpoints may have moved; rediscover on the next attempt.
+            self._metadata.pop(server, None)
+            raise
+
+    async def _refresh_with(
+        self,
+        server: ServerConfig,
+        key: CredentialKey,
+        credential: OAuthCredential,
+        metadata: OAuthMetadata,
+    ) -> str:
         if (
             credential.issuer != metadata.issuer
             or credential.resource != _required(server.auth.resource, "resource")
@@ -424,7 +466,14 @@ class OAuthManager:
     def logout(self, server: ServerConfig) -> bool:
         key = self.credential_key(server)
         self._access_tokens.discard(key)
+        self._metadata.pop(server, None)
         return self._store.delete(key)
+
+    def _refresh_lock(self, key: CredentialKey) -> asyncio.Lock:
+        lock = self._refresh_locks.get(key)
+        if lock is None:
+            lock = self._refresh_locks[key] = asyncio.Lock()
+        return lock
 
     def credential_key(self, server: ServerConfig) -> CredentialKey:
         return CredentialKey(
